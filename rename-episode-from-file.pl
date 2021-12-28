@@ -13,10 +13,7 @@ use HTML::TreeBuilder;
 BEGIN {
     $0 =~ m=^((.*)[:/\\])?(\w+)(\..*)?$=;
     my ($ScriptDir) = $2 || "";
-    #my $sharedLibs = '/usr/share/perl/5.14.2';
-    #-d $sharedLibs and unshift @INC, $sharedLibs;
     unshift @INC, $ScriptDir;
-    #print join ("\n\t", @INC);
 }
 
 my ($ScriptName) = $0;
@@ -29,7 +26,7 @@ my $isMissing = 0;
 my $isDuplicate = 0;
 my $isKeepLibrary = 0;
 my $isDumpLibrary = 0;
-my $filterLibrary = undef; #qr/(M.*?nster|Thiel|Boerne)/i;
+my $filterLibrary = undef;
 my $isAllFiles = 0;
 my $videoFileFilter = qr/\.mp(?:eg)?4$/i;
 my $downloadTimeout = 2*60;

@@ -1,6 +1,6 @@
 # TV Series Renamer (beta)
 
-[![Poject: Rename Episode](https://img.shields.io/badge/Project-rename-episode-from-file-red.svg?style=flat-square)](https://github.com/awalon/rename-episode-from-file/)
+[![Poject: Rename Episode](https://img.shields.io/badge/Project-rename--episode--from--file-red.svg?style=flat-square)](https://github.com/awalon/rename-episode-from-file/)
 [![License: GPL](https://img.shields.io/badge/License-GPL-green?style=flat-square)](LICENSE.md)
 [![GitHub issues](https://img.shields.io/github/issues/awalon/rename-episode-from-file?style=flat-square)](https://github.com/awalon/rename-episode-from-file/issues)
 ![Perl version: 5.32](https://img.shields.io/badge/Version-5.32-informational?style=flat-square&logo=perl)
