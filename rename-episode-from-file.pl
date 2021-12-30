@@ -35,6 +35,35 @@ my %library;
 my $newLibraryFound = 0;
 $Data::Dumper::Sortkeys = 1;
 
+my $cError = 0;
+my $cFatal = 0;
+my $cWarn  = 0;
+sub logger #($tag, $message)
+{
+    my ($tag, @message) = @_;
+    my ($sec, $min, $hour, $day, $mon, $year) = localtime();
+    my $ts = sprintf("%04d-%02d-%02d %02d:%02d.%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+
+    if ($tag eq "E") {
+        $cError++;
+        $tag = "ERROR";
+    } elsif ($tag eq "F") {
+        $tag = "FATAL";
+        $cFatal++;
+    } elsif ($tag eq "W") {
+        $tag = "WARN";
+        $cWarn++;
+    } elsif ($tag eq "T") {
+        $isVerbose or return 1;
+        $tag = "TRACE" ;
+    }  else {
+        $tag = "INFO";
+    }
+    print (join('', map {sprintf("%s %-6s %s\n", $ts, $tag, $_) } @message));
+    $cFatal > 0 and die "";
+    return 1;
+}
+
 sub basename #($file)
 {
     my ($file) = @_;
@@ -65,18 +94,18 @@ sub renameFileSet #($oldFileName, $newFileName, $path);
             $target =~ s/\\ / /g;
             $target =~ s/\\'/'/g;
 
-            my $mtime = (stat($source))[9] or die "+++ cannot stat '${source}': $!\n";
+            my $mtime = (stat($source))[9] or logger ('F', "+++ cannot stat '${source}': $!");
             if (time() - $downloadTimeout < $mtime) {
-                print STDERR "\nINFO     cannot rename: '${source}': file was changed few seconds ago, assumed running download (retry in ${downloadTimeout} sec. please)'\n";
+                logger ('I', "cannot rename: '${source}': file was changed few seconds ago, assumed running download (retry in ${downloadTimeout} sec. please)'");
                 $rc = 99;
             }
 
             if ($isDryRun > 0) {
-                print STDERR "\nINFO     renamed (--dry-run): '${source}' -> '${target}'\n";
+                logger ('I', "renamed (--dry-run): '${source}' -> '${target}'");
                 $rc = 1;
             } else {
-                $rc = rename($source, $target) || die ( "+++ cannot rename '${source}' -> '${target}': $!\n");
-                print STDERR "\nINFO     renamed: '${source}' -> '${target}'\n";
+                $rc = rename($source, $target) || logger ('F', "+++ cannot rename '${source}' -> '${target}': $!");
+                logger ('I', "renamed: '${source}' -> '${target}'");
             }
         }
     }
@@ -129,7 +158,7 @@ sub readLibrary #($file)
     foreach my $library (@libraryFiles) {
         exists $library{'-libraryFiles'} and exists $library{'-libraryFiles'}{$library} and next;
 
-        $isVerbose > 2 and print STDERR "TRACE     read library: '$library'\n";
+        $isVerbose > 1 and logger ('T', "read library: '$library'");
         my $t = HTML::TreeBuilder->new;
         $t->utf8_mode(1);
         $t->ignore_unknown(0);
@@ -212,26 +241,26 @@ sub readLibrary #($file)
             }
         }
 
-        $isVerbose > 2 and print STDERR "\nTRACE  library '$library' with: ${entries} entries\n";
-        $isVerbose > 2 and print STDERR "TRACE  ---------------------------------------------------------------------------------------------\n";
+        $isVerbose > 1 and logger ('T', "library '$library' with: ${entries} entries");
+        $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
     }
 
     my @keys = sort keys %library;
-    my $libraryTables = scalar @keys or die "FATAL  +++ no library entries found!!!\n";
+    my $libraryTables = scalar @keys or logger ('F', "+++ no library entries found!!!");
     if ($newEntries > 0) {
         $library{'-libraryKeys'} = \@keys;
         my %fileHash = map {($_, 1)} @libraryFiles;
         $library{'-libraryFiles'} = \%fileHash;
         $isDumpLibrary and print STDERR Dumper(\%library);
     }
-    $isVerbose > 2 and print STDERR "\nTRACE  library tables found: ${libraryTables} (in " . (scalar @libraryFiles) . " HTML files)\n";
-    $isVerbose > 2 and print STDERR "TRACE  ---------------------------------------------------------------------------------------------\n";
+    $isVerbose > 1 and logger ('T', "library tables found: ${libraryTables} (in " . (scalar @libraryFiles) . " HTML files)", 
+        "---------------------------------------------------------------------------------------------");
 }
 
 sub checkFile #($fileName, $path)
 {
     my ($fileName, $path) = @_;
-    $isVerbose > 2 and print STDERR "TRACE    checking file: '${fileName}'\n";
+    $isVerbose > 1 and logger ('T', "checking file: '${fileName}'");
 
     $isAllFiles and $fileName =~ m/\.html$/ and return; # skip library files
 
@@ -252,10 +281,10 @@ sub checkFile #($fileName, $path)
             if ($bn_enc =~ $re) {
                 my $match = $1;
 
-                $isVerbose > 2 and print STDERR "TRACE    * matched '$bn' with '$pattern' from '${rowKey}'\@'${libraryFile}'\n";
+                $isVerbose > 1 and logger ('T', "* matched '$bn'", "  with '$pattern'", "  from '${rowKey}'\@'${libraryFile}'");
 
                 if ($bn =~ qr/^(S[^_]+_E[^_]+|$row->{'-se_key'})_/) {
-                    $isVerbose and print STDERR "WARN     matched '$bn' already contains series key '$row->{'-se_key'}', keeping current file name.\n";
+                    $isVerbose and logger ('W', "matched '$bn' already contains series key '$row->{'-se_key'}', keeping current file name.");
                 } else {
                     my $newFileName = "$row->{'-se_key'}_${bn}";
                     my $renRc = renameFileSet($bn, $newFileName, $path);
@@ -285,7 +314,7 @@ sub checkFile #($fileName, $path)
         $rc and last;
     }
     $rc or do {$isVerbose and print STDERR "WARN     +++ no match for '$bn'\n"};
-    $isVerbose > 2 and print STDERR "TRACE  ---------------------------------------------------------------------------------------------\n";
+    $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
 }
 
 my %seenDir;
@@ -303,13 +332,13 @@ sub walkDir #($item)
         if (-d $_) {
             (my $subDir = $_) =~ s/^$globDir//;
             if (exists $seenDir {$subDir}) {
-                $isVerbose > 2 and print STDERR "\nTRACE  already seen folder: ".$seenDir {$subDir};
+                $isVerbose > 1 and print STDERR "\nTRACE  already seen folder: ".$seenDir {$subDir};
                 exists $multiDir {$subDir} or $multiDir {$subDir} = $seenDir {$subDir};
                 $multiDir {$subDir} .= "\n\t$_";
             }
             $seenDir {$subDir} = $_;
-            $isVerbose > 2 and print STDERR "\nTRACE  scanning folder: '$_'\n";
-            $isVerbose > 2 and print STDERR "TRACE  ---------------------------------------------------------------------------------------------\n";
+            $isVerbose > 1 and logger ('T', "scanning folder: '$_'", 
+                "---------------------------------------------------------------------------------------------");
             walkDir ($_);
         } elsif (-f $_ && ($isAllFiles || $_ =~ $videoFileFilter)) {
             checkFile ($_, $globDir);
@@ -367,20 +396,20 @@ sub printMissingSeries #()
                 $isMissing or next;
                 print STDERR "ERROR  missing episode:\n${info}";
             }
-            $isVerbose > 2 and print STDERR "TRACE  ---------------------------------------------------------------------------------------------\n";
+            $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
         }
     }
 
-    print STDERR "INFO   ---------------------------------------------------------------------------------------------\n";
-    print STDERR "INFO   Summary:\n";
-    print STDERR "INFO   - episodes found:      " . sprintf("%10s", $seen, ) . ($skip ? sprintf(" / skipped: %10s (try again in about $downloadTimeout sec.)", $skip) : '') . "\n";
-    print STDERR "INFO   - episodes missing:    " . sprintf("%10s", $mis) . "\n";
-    print STDERR "INFO   - duplicate matches:   " . sprintf("%10s", $dup) . "\n";
+    logger ('I', "---------------------------------------------------------------------------------------------",
+        "Summary:",
+        "- episodes found:      " . sprintf("%10s", $seen, ) . ($skip ? sprintf(" / skipped: %10s (try again in about $downloadTimeout sec.)", $skip) : ''),
+        "- episodes missing:    " . sprintf("%10s", $mis),
+        "- duplicate matches:   " . sprintf("%10s", $dup));
     if (defined $filterLibrary) {
-        print STDERR "INFO   ---------------------------------------------------------------------------------------------\n";
-        print STDERR "INFO   - episodes found by '$filterLibrary':      " . sprintf("%10s", $filter{'seen'}) . "\n";
-        print STDERR "INFO   - episodes missing by '$filterLibrary':    " . sprintf("%10s", $filter{'missing'}) . "\n";
-        print STDERR "INFO   - duplicate matches by '$filterLibrary':   " . sprintf("%10s", $filter{'duplicate'}) . "\n";
+        logger ('I', "---------------------------------------------------------------------------------------------",
+            "- episodes found by '$filterLibrary':      " . sprintf("%10s", $filter{'seen'}),
+            "- episodes missing by '$filterLibrary':    " . sprintf("%10s", $filter{'missing'}),
+            "- duplicate matches by '$filterLibrary':   " . sprintf("%10s", $filter{'duplicate'}));
     }
 }
 
@@ -420,29 +449,29 @@ sub main #()
         -exitval => 9
     );
 
-    $isVerbose > 2 and print STDERR "TRACE  ---------------------------------------------------------------------------------------------\n";
-    $isVerbose > 2 and print STDERR "TRACE  Script:           $0\n";
-    $isVerbose > 2 and print STDERR "TRACE  OS:               $^O\n";
-    $isVerbose > 2 and print STDERR "TRACE  Perl:             $^X\n";
-    $isVerbose > 2 and print STDERR "TRACE  Includes:         ".join ("\n                  ", (grep {!m/^.$/} map { $^O =~ m/MSwin/i and s{/}{\\}g; $_; } @INC))."\n";
-    $isVerbose > 2 and print STDERR "TRACE  Perl Version:     $^V ($])\n";
-    $isVerbose > 2 and print STDERR "TRACE  PID:              $$\n";
-    $isVerbose > 2 and print STDERR "TRACE  Root folders:     ".join ("\n                  ", @rootDirs)."\n";
+    $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------",
+        "Script:           $0",
+        "OS:               $^O",
+        "Perl:             $^X",
+        "Includes:         ".join ("\n                  ", (grep {!m/^.$/} map { $^O =~ m/MSwin/i and s{/}{\\}g; $_; } @INC)),
+        "Perl Version:     $^V ($])",
+        "PID:              $$",
+        "Root folders:     ".join ("\n                  ", @rootDirs));
 
     foreach my $rootDir (@rootDirs) {
         $rootDir =~ s#[/\\]*$##g;
         $newLibraryFound = 0;
         $isKeepLibrary or %library = ();
-        print STDERR "INFO   ---------------------------------------------------------------------------------------------\n";
-        print STDERR "INFO   scanning folder: '${rootDir}'\n";
-        print STDERR "INFO   ---------------------------------------------------------------------------------------------\n";
+        logger('I', '---------------------------------------------------------------------------------------------',
+            "scanning folder: '${rootDir}'",
+            '---------------------------------------------------------------------------------------------');
         readLibrary (glob ("'$rootDir'/*.html"));
         walkDir ($rootDir);
-        $isKeepLibrary and $newLibraryFound and print STDERR "INFO   keeping library from folder: '${rootDir}'\n";
+        $isKeepLibrary and $newLibraryFound and logger ('I', "keeping library from folder: '${rootDir}'");
     }
-    $isVerbose > 2 and print STDERR "TRACE  ---------------------------------------------------------------------------------------------\n";
+    $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
     $isSummary and printMissingSeries();
-    print STDERR "INFO   duration ".(time () - $startTime)." sec.\n";
+    logger ('I', "duration ".(time () - $startTime)." sec.");
     return 1;
 }
 
