@@ -49,7 +49,7 @@ wget rename-episode-from-file.pl
 
 ### How rename newly added recordings
 Just execute (rename-episode-from-file.pl) again, as files already having prefix 
-S<season_E<episode>_ won't be changed.
+S&lt;season&gt;_E&lt;episode&gt;_ won't be changed.
 
 ### Some files of TV series set wasn't renamed
 Just execute (rename-episode-from-file.pl) with `--dry-run --scan-all` to check if problem can
