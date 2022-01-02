@@ -24,6 +24,7 @@ my $isDryRun = 0;
 my $isSummary = 1;
 my $isMissing = 0;
 my $isDuplicate = 0;
+my $useEpisodeOfYear = 0;
 my $isKeepLibrary = 0;
 my $isDumpLibrary = 0;
 my $filterLibrary = undef;
@@ -83,7 +84,7 @@ sub renameFileSet #($oldFileName, $newFileName, $path);
 
     my $globKey = "${path}/${oldFn}" . ($isAllFiles ? ".${oldExt}" : '.');
     my $rc = 0;
-    foreach (<$globKey*>) {
+    foreach (glob("${globKey}*")) {
         s/\\ / /g;
         s/\\'/'/g;
 
@@ -97,7 +98,7 @@ sub renameFileSet #($oldFileName, $newFileName, $path);
             my $mtime = (stat($source))[9] or logger ('F', "+++ cannot stat '${source}': $!");
             if (time() - $downloadTimeout < $mtime) {
                 logger ('I', "cannot rename: '${source}': file was changed few seconds ago, assumed running download (retry in ${downloadTimeout} sec. please)'");
-                $rc = 99;
+                return 99;
             }
 
             if ($isDryRun > 0) {
@@ -124,20 +125,24 @@ sub getRegEx #($rowHash);
         my $len = length($val);
         $len > 3 or next; # only content with more than 3 chars
         my $withDate = $len > 4 ? '(?:[\(_]?(?:\d{2}|\d{4})[\)_]?)?' : '';
+        my $withEpisode = $len > 4 ? '(?:[\(_]*?(?:episode|folge)_\d+[\)_]*?)?' : '';
 
         $val =~ s#[\.]#~~dot~~#g; # keep dot but make it optional
         $val =~ s#([_\s]+)#~~space~~#ug; # normalize space
+        $val =~ s#[\\/]#~~slash~~#g; # mask '/' and '\' and make them optional
+
+        $val =~ s#([\.\?,:\-\(\)])#_?\\$1_?#g; # mask and allow spaces before and after: dot, ...
 
         $val =~ s#(ß|ss)#(ß|ss)#iug; # handle special char "ß"
-        $val =~ s#[^a-z0-9\.\?,:\-\(\)\|~]#.?#iug; # non greedy wildcard for any non ASCII char
+        $val =~ s#[^a-z0-9\\_\.\?,:\-\(\)\|~]#.*?#iug; # non greedy wildcard for any non ASCII char
 
         $val =~ s#(\d+)#0*$1#g; # allow leading zeros for numbers
 
-        $val =~ s#~~space~~#[_ ]+?#g;
-        $val =~ s#~~dot~~#\.?#g;
+        $val =~ s#~~slash~~#.?#g;
+        $val =~ s#~~space~~#[_ ]*?#g;
+        $val =~ s#~~dot~~#\\.?#g;
 
-        $val =~ s#(\\[\.\?,:\-\(\)])#_?$1_?#g; # allow spaces before and after: dot, ...
-        push @regex, "(-\\1?[-_]*?${val}_*?\\1?${withDate}[-_]*?\\1?-)"; # allow optional date (year)
+        push @regex, sprintf "(-\\1?[-_]*?%s%s_*?\\1?%s[-_]*?\\1?-)", $withEpisode, $val, $withDate; # allow optional date (year)
     }
     return join ("|", @regex); # join all cell regex groups with "or"
 }
@@ -147,7 +152,7 @@ sub getEpisodeKey #($season, $episode)
     my ($season, $episode) = @_;
     $season //= 1;
     $episode //= 0;
-    return sprintf('S%02s_E%02s', $season, $episode);
+    return sprintf('S%03s_E%04s', $season, $episode);
 }
 
 sub readLibrary #($file)
@@ -173,15 +178,21 @@ sub readLibrary #($file)
             my $libKey = "${library}::" . $tc++;
 
             # search season (before table)
-            my $season = 1;
-            my @before = $table->right();
+            my $season;
+            my @before = $table->left();
             if (@before) {
-                my $seasonPattern = qr/(season|staffel)_?/i;
-                my $season_element = $before[0]->look_down('id' => qr/^(season|staffel).*$/i);
-                if (ref $season_element eq "HASH") {
-                    ($season = $season_element->id) =~ s#\s*$seasonPattern\s*##i;
+                foreach my $elem (reverse @before) {
+                    my @seasonMatches = $elem->look_down('id' => qr/^.*?(season|staffel).*$/i);
+                    foreach my $seasonElement (reverse @seasonMatches)  {
+                        if (ref $seasonElement eq 'HTML::Element') {
+                            ($season = $seasonElement->id) =~ s#^.*?(\d+).*?$#$1#i;
+                            $season and last;
+                        }
+                    }
+                    $season and last;
                 }
             }
+            $season //= 1;
 
             my @head = $table->find('th');
             foreach my $head (@head) {
@@ -220,10 +231,14 @@ sub readLibrary #($file)
                     $data{'-library'} = $libKey;
                     $data{'-regex'} = getRegEx(%data);
                     $data{'-season'} = $season;
-                    $data{'-episode'} = exists $data{'Nr. (St.)'} ? $data{'Nr. (St.)'} :
-                        exists $data{'Folge'} ? $data{'Folge'} : $data{'Nr.'};
+                    $data{'-episode'} =
+                        exists $data{'Nr. (St.)'} ? $data{'Nr. (St.)'} :
+                            exists $data{'Folge'} ? $data{'Folge'} :
+                                exists $data{'Nr.'} ? $data{'Nr.'} : '';
                     $data{'-se_key'} = getEpisodeKey ($data{'-season'}, $data{'-episode'});
                     $data{'-se_key'} =~ s#[^a-z0-9_]#_#ig;
+                    ($data{'-year'} = $key) =~ s/\b$data{'-episode'}\b//; # remove episode (could conflict with year)
+                    $data{'-year'} =~ s#^.*?((19|20|21)\d{2}).*?$#$1#; # extract year
                     $id or $id = $data{'-se_key'};
                     (exists $db{$id} or !$id) and $id = $r++;
                     $data{'-id'} = $id;
@@ -238,6 +253,17 @@ sub readLibrary #($file)
                 my @keys = sort keys %db;
                 $newEntries and $db{'-rowKeys'} = \@keys;
                 $entries += scalar @keys;
+
+                if ($useEpisodeOfYear > 0) {
+                    my @seKeyList = sort { $db{$a}{'-se_key'} cmp $db{$b}{'-se_key'} } grep $_ =~ m/^[^-].*/, keys %db;
+                    foreach my $key (@seKeyList) {
+                        my $data = $db{$key};
+                        exists $db{'-byYear'}{$data->{'-year'}} or $db{'-byYear'}{$data->{'-year'}} = 0;
+                        $data->{'-year_episode'} = ++$db{'-byYear'}{$data->{'-year'}};
+                        $data->{'-se_key_by_year'} = getEpisodeKey ($data->{'-year'}, $data->{'-year_episode'});
+                        $data->{'-se_key_by_year'} =~ s#[^a-z0-9_]#_#ig;
+                    }
+                }
             }
         }
 
@@ -266,6 +292,8 @@ sub checkFile #($fileName, $path)
 
     my $bn = basename($fileName);
     my $bn_enc = !Encode::is_utf8($bn) ? Encode::decode('utf-8', $bn) : $bn;
+    my $seKeyPattern = qr/([_(]*S\d[^_-]*_E\d[^_-]*[_)]*)/;
+    $bn_enc =~ s/$seKeyPattern//g; # ignore existing se-keys
     my $rc = 0;
     foreach my $libraryFile (@{$library{'-libraryKeys'}}) {
         $libraryFile =~ m/^-/ and next;
@@ -276,17 +304,21 @@ sub checkFile #($fileName, $path)
             my $row = $db->{$rowKey};
 
             # match: (S01_E02_)?(Thema)(<search pattern from HTML [regex generator: getRegEx]>)
-            my $pattern = "^(?:(?:S[^_]+_E[^_]+|$row->{'-se_key'})_)?([^-]+)(-[^-]+)?($row->{'-regex'})";
+            my $pattern = "^([^-]+)(-[^-]+)?($row->{'-regex'})";
             my $re = qr/$pattern/ui;
             if ($bn_enc =~ $re) {
                 my $match = $1;
+                my $seKey = $useEpisodeOfYear ? $row->{'-se_key_by_year'} : $row->{'-se_key'};
 
                 $isVerbose > 1 and logger ('T', "* matched '$bn'", "  with '$pattern'", "  from '${rowKey}'\@'${libraryFile}'");
 
-                if ($bn =~ qr/^(S[^_]+_E[^_]+|$row->{'-se_key'})_/) {
-                    $isVerbose and logger ('W', "matched '$bn' already contains series key '$row->{'-se_key'}', keeping current file name.");
+                #if ($bn =~ qr/^(S[^_]+_E[^_]+|$row->{'-se_key'})_/) {
+                my @seMatchesBn = ($bn =~ m/$seKeyPattern/g);
+                if ($bn =~ qr/^($seKey)_/ && scalar @seMatchesBn == 1) {
+                    $isVerbose and logger ('T', "matched '$bn' already contains series key '${seKey}', keeping current file name.");
                 } else {
-                    my $newFileName = "$row->{'-se_key'}_${bn}";
+                    (my $newFileName = ${bn}) =~ s/$seKeyPattern//g; # remove old/wrong key from source file
+                    $newFileName = "${seKey}_${newFileName}";
                     my $renRc = renameFileSet($bn, $newFileName, $path);
                     if ($renRc == 99) {
                         $row->{'-downloading'} = 1;
@@ -294,6 +326,7 @@ sub checkFile #($fileName, $path)
                         # use new name for stats
                         $bn = $newFileName;
                     }
+                    $row->{'-renamed'}++;
                 }
 
                 if ($bn =~ $videoFileFilter) { # don't collect all files if $isAllFiles was set
@@ -313,7 +346,7 @@ sub checkFile #($fileName, $path)
 
         $rc and last;
     }
-    $rc or do {$isVerbose and print STDERR "WARN     +++ no match for '$bn'\n"};
+    $rc or logger ('W', "+++ no match for '$bn'");
     $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
 }
 
@@ -326,7 +359,7 @@ sub walkDir #($item)
     (my $globDir = $item) =~ s{\\}{/}g;
     $globDir =~ s/ /\\ /g;
     $globDir =~ s/'/\\'/g;
-    foreach (<$globDir/*>) {
+    foreach (glob("${globDir}/*")) {
         s/\\ / /g;
         s/\\'/'/g;
         if (-d $_) {
@@ -354,6 +387,7 @@ sub printMissingSeries #()
     my $mis = 0;
     my $seen = 0;
     my $skip = 0;
+    my $ren = 0;
 
     my %filter = ('missing' => 0, 'seen' => 0, 'duplicate' => 0);
 
@@ -371,6 +405,7 @@ sub printMissingSeries #()
                 $info .= sprintf("         %-40s: %s\n", $key, $row->{$key});
             }
             if (exists $row->{'-matched'}) {
+                $row->{'-renamed'} and $ren++;
                 $row->{'-downloading'} and $skip++;
                 if ($row->{'-matched'} > 1) {
                     $dup++;
@@ -404,7 +439,8 @@ sub printMissingSeries #()
         "Summary:",
         "- episodes found:      " . sprintf("%10s", $seen, ) . ($skip ? sprintf(" / skipped: %10s (try again in about $downloadTimeout sec.)", $skip) : ''),
         "- episodes missing:    " . sprintf("%10s", $mis),
-        "- duplicate matches:   " . sprintf("%10s", $dup));
+        "- duplicate matches:   " . sprintf("%10s", $dup),
+        "- episodes renamed:    " . sprintf("%10s", $ren));
     if (defined $filterLibrary) {
         logger ('I', "---------------------------------------------------------------------------------------------",
             "- episodes found by '$filterLibrary':      " . sprintf("%10s", $filter{'seen'}),
@@ -427,18 +463,19 @@ sub main #()
 
     Getopt::Long::Configure ("no_ignore_case", "bundling_override");
     GetOptions (
-        "folder|f=s@"        => \@rootDirs,
-        "summary|s!"         => \$isSummary,
-        "show-missing|M!"    => \$isMissing,
-        "show-duplicates|D!" => \$isDuplicate,
-        "dry-run|dr!"        => \$isDryRun,
-        "keep-library|kl!"   => \$isKeepLibrary,
-        "dump-library|dl!"   => \$isDumpLibrary,
-        "verbose|v+"         => \$isVerbose,
-        "help|h"             => \$isHelp,
-        "usage|u"            => \$isUsage,
-        "episode-filter|e=s" => \$filterPattern,
-        "scan-all!"          => \$isAllFiles,
+        "folder|f=s@"         => \@rootDirs,
+        "summary|s!"          => \$isSummary,
+        "show-missing|M!"     => \$isMissing,
+        "show-duplicates|D!"  => \$isDuplicate,
+        "dry-run|dr!"         => \$isDryRun,
+        "keep-library|kl!"    => \$isKeepLibrary,
+        "dump-library|dl!"    => \$isDumpLibrary,
+        "verbose|v+"          => \$isVerbose,
+        "help|h"              => \$isHelp,
+        "usage|u"             => \$isUsage,
+        "episode-filter|e=s"  => \$filterPattern,
+        "episode-of-year|ey!" => \$useEpisodeOfYear,
+        "scan-all!"           => \$isAllFiles,
     ) or pod2usage(-exitval => 9);
     $isUsage and pod2usage(-exitval => 8);
     $isHelp  and pod2usage(-exitval => 8, -verbose => 2);
@@ -504,6 +541,7 @@ B<rename-episode-from-file.pl> [options]
     --verbose,-v            be verbose
     --help,-h               show help
     --usage,-u              show this usage
+    --episode-of-year,-ey   count episode by year (S<year>_E<episode by year>_)
     --episode-filter=<regex>,-e <regex>
                             filter episodes provided by HTML file by regular expression
     --scan-all              experimental: Scan and rename all file types
