@@ -142,17 +142,42 @@ sub getRegEx #($rowHash);
         $val =~ s#~~space~~#[_ ]*?#g;
         $val =~ s#~~dot~~#\\.?#g;
 
-        push @regex, sprintf "(-\\1?[-_]*?%s%s_*?\\1?%s[-_]*?\\1?-)", $withEpisode, $val, $withDate; # allow optional date (year)
+        push @regex, sprintf "(-\\2?[-_]*?%s%s_*?\\2?%s[-_]*?\\2?-)", $withEpisode, $val, $withDate; # allow optional date (year)
     }
     return join ("|", @regex); # join all cell regex groups with "or"
 }
 
-sub getEpisodeKey #($season, $episode)
+sub getEpisodeKey #($season, $episode, ?$pattern)
 {
-    my ($season, $episode) = @_;
+    my ($season, $episode, $pattern) = @_;
+    $pattern //= 'S%03s_E%04s';
     $season //= 1;
     $episode //= 0;
-    return sprintf('S%03s_E%04s', $season, $episode);
+    # remove leading season from episode
+    $episode =~ s/^$season[\.,_]0*([^0]+\d*)$/$1/g;
+    return sprintf($pattern, $season, $episode);
+}
+
+sub getNoInSeries #(@columns)
+{
+    my @columns = @_;
+
+    # pattern will search for
+    # (No.|Nr.|#)(up to short 3 chars words)(folge|episode|series|staffel|st.)(up to short 3 chars words)(staffel|season)(no. of season)
+    my %options = map {
+            $_, length($_)
+        }
+        grep {
+            m/^\s*((N[ro]\.?)|#)?\s*(\w{1,3}\s+)?(\(?(folge|episode)\)?)?\s*(\w{1,3}\s+)?(\(?(series|st(affel|\.)?)(\s*\d+)?\)?)?\s*$/i
+        } @columns;
+    # Ex. by prio:
+    # 'Nr. (St.)'
+    # 'No. in series'
+    # 'Folge'
+    # 'Nr.'
+    # ... sort by length
+    my @prio = (sort { $options{$a} <=> $options{$b} } keys %options);
+    return scalar @prio ? $prio[-1] : undef;
 }
 
 sub readLibrary #($file)
@@ -172,10 +197,14 @@ sub readLibrary #($file)
 
         my @tables = $t->find('table');
         my $tc = 0;
-        foreach my $table (@tables) {
+        TABLE: foreach my $table (@tables) {
             my %db;
             my @fields;
             my $libKey = "${library}::" . $tc++;
+
+            # search for nested table and skip parent tables
+            my @nestedTables = $table->find('table');
+            scalar @nestedTables > 1 and next TABLE;
 
             # search season (before table)
             my $season;
@@ -195,13 +224,69 @@ sub readLibrary #($file)
             $season //= 1;
 
             my @head = $table->find('th');
+            my $parentRow;
+            my $maxRows = 1;
+            my $curRow = 0;
+            my $curCol = 0;
+            my $colCount = 0;
+            my %colSpans = ('-end' => undef);
+            my %rowSpans = ();
             foreach my $head (@head) {
-                push(@fields, $head->as_text_trimmed);
+                my $currentValue = $head->as_text_trimmed;
+                $isVerbose > 2 and logger ('T', "extract column field: $currentValue");
+
+                my $parent = $head->parent;
+                $parentRow //= $parent;
+                if (!$parentRow->same_as($parent)) {
+                    $parentRow = $parent; # next row
+                    $curRow++;
+                    $curCol = 0;
+                    $curCol > $colCount and $colCount = $curCol;
+                    $colSpans{'-end'} = undef;
+                }
+
+                if ($curRow > 0) {
+                    exists $rowSpans{$curCol} and $rowSpans{$curCol}-- > 0 and $curCol++;
+                }
+                if (defined $head->attr('rowspan')) {
+                    $head->attr('rowspan') > $maxRows and $maxRows = $head->attr('rowspan');
+                    $rowSpans{$curCol} = $head->attr('rowspan');
+                } else {
+                    $rowSpans{$curCol} = 0;
+                }
+                if (defined $head->attr('colspan')) {
+                    $colSpans{$curCol} = $head->attr('colspan');
+                    if ($curRow == 0) {
+                        push(@fields, ('') x $colSpans{$curCol}); # fill undef (colspan) with next row
+                    }
+                    $curCol += $colSpans{$curCol};
+                    $curCol > $colCount and $colCount = $curCol;
+                } else {
+                    # search for th having title attribute defined
+                    my @title = $head->look_down('title' => qr/^.+$/i);
+                    my $columnName = scalar @title ? $title[-1]->attr('title') : $currentValue;
+                    if ($curRow > 1 && (exists $colSpans{$curCol} || $colSpans{'-end'})) {
+                        # fill values for colspan fields
+                        $fields[$curCol] = $columnName;
+                        $colSpans{'-end'} //= $colSpans{$curCol};
+                        $colSpans{'-end'} -= 1;
+                    } else {
+                        if ($curRow == 0) {
+                            push(@fields, $columnName);
+                        } else {
+                            $fields[$curCol] = $columnName
+                        }
+                    }
+                    $curCol++;
+                }
             }
 
-            my @rows = $table->find('tr');
+            #my @rows = $table->find('tr');
+            my @rows = $table->look_down(_tag => 'tr');
             my $r = 0;
-            foreach my $row (@rows) {
+            my $episodeColumn = getNoInSeries (@fields);
+            %rowSpans = ();
+            ROWS: foreach my $row (@rows) {
                 my %data;
 
                 # remove useless data
@@ -210,35 +295,92 @@ sub readLibrary #($file)
 
                 my $key = $row->as_text_trimmed;
 
-                my @cells = $row->find('td');
+                my @cells = $row->look_down(_tag => 'td');
+                my $cellsCount = scalar @cells;
+                $cellsCount > 0 or next;
+                $cellsCount > $colCount and $colCount = $cellsCount;
                 my $i = 0;
                 my $id;
                 foreach my $cell (@cells) {
-                    if ($cell->id) {
-                        $id = $cell->id;
+                    my $value;
+
+                    while (exists $rowSpans{$i} and $rowSpans{$i}{'-row'}-- > 0) {
+                        # insert spanned cell from previous row(s)
+                        $value = $rowSpans{$i}{'-value'};
+                        $id //= $rowSpans{$i}{'-id'};
+
+                        if (scalar @fields > $i) {
+                            $data{$fields[$i++]} = $value;
+                        } else {
+                            $data{$i++} = $value;
+                        }
                     }
-                    if (@fields) {
-                        $data{$fields[$i++]} = $cell->as_text_trimmed;
+
+                    $value = $cell->as_text_trimmed;
+                    if ($cell->id) {
+                        $id //= $cell->id;
+                    }
+                    if (defined $cell->attr('rowspan')) {
+                        # remember spanned row values for next cells
+                        $rowSpans{$i} = {
+                            '-row' => $cell->attr('rowspan') - 1,
+                            '-value' => $value,
+                            '-id' => $id,
+                        };
                     } else {
-                        $data{$i++} = $cell->as_text_trimmed;
+                        $rowSpans{$i}{'-row'} = 0;
+                    }
+
+                    if (scalar @fields > $i) {
+                        $data{$fields[$i++]} = $value;
+                    } else {
+                        $data{$i++} = $value;
+                    }
+                }
+                for (my $c = $i; $c < $colCount; $c++) {
+                    if (exists $rowSpans{$c} and $rowSpans{$c}{'-row'}-- > 0) {
+                        # insert spanned cell from previous row(s)
+                        my $value = $rowSpans{$c}{'-value'};
+                        $id //= $rowSpans{$c}{'-id'};
+
+                        if (scalar @fields > $c) {
+                            $data{$fields[$c]} = $value;
+                        } else {
+                            $data{$c} = $value;
+                        }
                     }
                 }
 
-                if (keys %data) {
-                    grep /titel|title/i, keys %data or next;
+                my @columnNames = (keys %data);
+                # need at least 2 extracted data columns (episode and name)
+                unless (scalar(@columnNames) >= 2) {
+                    #$isVerbose > 2 and
+                        logger ('T',
+                        sprintf(
+                            "skipping record with too small columns count '%d':", scalar(@columnNames)
+                        ),
+                        map { sprintf('%-20s: %s, ', $_, $data{$_}) } keys %data
+                    );
+                    next;
+                }
+
+                if (@columnNames) {
+                    #grep /titel|title/i, @columnNames or next;
+                    $episodeColumn ||= getNoInSeries (@columnNames);
+                    unless (defined($episodeColumn)) {
+                        $isVerbose > 1 and logger('T', "no episode column found, skipping table: $libKey");
+                        last ROWS;
+                    }
 
                     $data{'-content'} = $key;
                     $data{'-library'} = $libKey;
                     $data{'-regex'} = getRegEx(%data);
                     $data{'-season'} = $season;
-                    $data{'-episode'} =
-                        exists $data{'Nr. (St.)'} ? $data{'Nr. (St.)'} :
-                            exists $data{'Folge'} ? $data{'Folge'} :
-                                exists $data{'Nr.'} ? $data{'Nr.'} : '';
+                    $data{'-episode'} = ($episodeColumn && exists $data{$episodeColumn}) ? $data{$episodeColumn} : '';
                     $data{'-se_key'} = getEpisodeKey ($data{'-season'}, $data{'-episode'});
                     $data{'-se_key'} =~ s#[^a-z0-9_]#_#ig;
                     ($data{'-year'} = $key) =~ s/\b$data{'-episode'}\b//; # remove episode (could conflict with year)
-                    $data{'-year'} =~ s#^.*?((19|20|21)\d{2}).*?$#$1#; # extract year
+                    $data{'-year'} =~ s#^.*?((19|20|21)\d{2}).*?$#$1# or $data{'-year'} = ''; # extract year
                     $id or $id = $data{'-se_key'};
                     (exists $db{$id} or !$id) and $id = $r++;
                     $data{'-id'} = $id;
@@ -279,20 +421,24 @@ sub readLibrary #($file)
         $library{'-libraryFiles'} = \%fileHash;
         $isDumpLibrary and print STDERR Dumper(\%library);
     }
-    $isVerbose > 1 and logger ('T', "library tables found: ${libraryTables} (in " . (scalar @libraryFiles) . " HTML files)", 
-        "---------------------------------------------------------------------------------------------");
+    $isVerbose > 1 and logger ('T', "library tables found: ${libraryTables} (in " . (scalar @libraryFiles) . " HTML files)");
 }
 
 sub checkFile #($fileName, $path)
 {
     my ($fileName, $path) = @_;
-    $isVerbose > 1 and logger ('T', "checking file: '${fileName}'");
+    $isVerbose > 1 and logger ('T',
+        '---------------------------------------------------------------------------------------------',
+        "checking file: '${fileName}'"
+    );
 
     $isAllFiles and $fileName =~ m/\.html$/ and return; # skip library files
 
     my $bn = basename($fileName);
+    my $bnOrg = $bn;
     my $bn_enc = !Encode::is_utf8($bn) ? Encode::decode('utf-8', $bn) : $bn;
     my $seKeyPattern = qr/([_(]*S\d[^_-]*_E\d[^_-]*[_)]*)/;
+    #TODO: Check if this could be used as fallback
     $bn_enc =~ s/$seKeyPattern//g; # ignore existing se-keys
     my $rc = 0;
     foreach my $libraryFile (@{$library{'-libraryKeys'}}) {
@@ -302,20 +448,30 @@ sub checkFile #($fileName, $path)
         foreach my $rowKey (@{$db->{'-rowKeys'}}) {
             $rowKey =~ m/^-/ and next;
             my $row = $db->{$rowKey};
+            my $seKey = $useEpisodeOfYear ? $row->{'-se_key_by_year'} : $row->{'-se_key'};
 
             # match: (S01_E02_)?(Thema)(<search pattern from HTML [regex generator: getRegEx]>)
-            my $pattern = "^([^-]+)(-[^-]+)?($row->{'-regex'})";
+            my $pattern = "^(([^-]+)(?:-[^-]+)?(?:$row->{'-regex'}))";
+            # append se-key as fallback
+            (my $seKeyPattern = $seKey) =~ s/^.*S0*([^E_]+)_E0*([^_]+).*$/S0*$1_E0*$2/;
+            $pattern .= "|.*?(${seKeyPattern})";
             my $re = qr/$pattern/ui;
             if ($bn_enc =~ $re) {
-                my $match = $1;
-                my $seKey = $useEpisodeOfYear ? $row->{'-se_key_by_year'} : $row->{'-se_key'};
+                (my $match = $1) //= '';
+                (my $matchTopic = $2) //= '';
+                (my $matchBySeKey = $3) //= '';
 
-                $isVerbose > 1 and logger ('T', "* matched '$bn'", "  with '$pattern'", "  from '${rowKey}'\@'${libraryFile}'");
+                $isVerbose > 1 and logger ('T',
+                    "* matched '$bn'",
+                    "  with pattern '$pattern'",
+                    "  [match::'${match}'; matchTopic::'${matchTopic}'; matchSeKey::'${matchBySeKey}']",
+                    "  from '${rowKey}'\@'${libraryFile}'"
+                );
 
                 #if ($bn =~ qr/^(S[^_]+_E[^_]+|$row->{'-se_key'})_/) {
                 my @seMatchesBn = ($bn =~ m/$seKeyPattern/g);
                 if ($bn =~ qr/^($seKey)_/ && scalar @seMatchesBn == 1) {
-                    $isVerbose and logger ('T', "matched '$bn' already contains series key '${seKey}', keeping current file name.");
+                    $isVerbose and logger ('T', "* matched '$bn' already contains series key '${seKey}', keeping current file name.");
                 } else {
                     (my $newFileName = ${bn}) =~ s/$seKeyPattern//g; # remove old/wrong key from source file
                     $newFileName = "${seKey}_${newFileName}";
@@ -331,11 +487,18 @@ sub checkFile #($fileName, $path)
 
                 if ($bn =~ $videoFileFilter) { # don't collect all files if $isAllFiles was set
                     $row->{'-matched'}++;
+                    my $info;
+                    if ($bn eq $bnOrg) {
+                        $info = sprintf "%-60s", $bnOrg;
+                    } else {
+                        $info = sprintf "%-60s [new: %-60s]", $bnOrg, $bn;
+                    }
+                    $isVerbose > 0 and $info .= "  [match::'${match}'; matchTopic::'${matchTopic}'; matchSeKey::'${matchBySeKey}']";
                     if (exists $row->{'-matchedFile'}) {
-                        push @{$row->{'-matchedFile'}}, ( $bn . ($isVerbose ? "  [match::${match}]" : '') );
+                        push @{$row->{'-matchedFile'}}, ( $info );
                     }
                     else {
-                        $row->{'-matchedFile'} = [ $bn . ($isVerbose ? "  [match::${match}]" : '') ];
+                        $row->{'-matchedFile'} = [ $info ];
                     }
                 }
 
@@ -347,7 +510,6 @@ sub checkFile #($fileName, $path)
         $rc and last;
     }
     $rc or logger ('W', "+++ no match for '$bn'");
-    $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
 }
 
 my %seenDir;
@@ -399,29 +561,31 @@ sub printMissingSeries #()
             $rowKey =~ m/^-/ and next;
             my $row = $db->{$rowKey};
 
-            my $info = "";
+            my @info;
             foreach my $key (sort keys %$row) {
                 $key =~ m/^-/ and next;
-                $info .= sprintf("         %-40s: %s\n", $key, $row->{$key});
+                push @info, sprintf("         %-40s: %s", $key, $row->{$key});
             }
             if (exists $row->{'-matched'}) {
                 $row->{'-renamed'} and $ren++;
                 $row->{'-downloading'} and $skip++;
+                $seen++;
+                if (defined $filterLibrary) {
+                    $row->{'-content'} =~ $filterLibrary and ++$filter{'seen'};
+                }
                 if ($row->{'-matched'} > 1) {
                     $dup++;
                     if (defined $filterLibrary) {
                         $row->{'-content'} =~ $filterLibrary and ++$filter{'duplicate'} or next;
                     }
                     $isDuplicate or next;
-                    print STDERR "ERROR  duplicate found:\n${info}";
-                    print STDERR "         Files:\n";
-                    print STDERR "         - ", join("\n         - ", @{$row->{'-matchedFile'}}), "\n";
-                } else {
-                    $seen++;
-                    if (defined $filterLibrary) {
-                        $row->{'-content'} =~ $filterLibrary and ++$filter{'seen'};
-                    }
-                    next;
+                    logger ('E',
+                        '---------------------------------------------------------------------------------------------',
+                        'ERROR  duplicate found:',
+                        @info,
+                        '         Files:',
+                        map { sprintf('         - %s', $_) } @{$row->{'-matchedFile'}}
+                    );
                 }
             } else {
                 $mis++;
@@ -429,9 +593,12 @@ sub printMissingSeries #()
                     $row->{'-content'} =~ $filterLibrary and ++$filter{'missing'} or next;
                 }
                 $isMissing or next;
-                print STDERR "ERROR  missing episode:\n${info}";
+                logger ('E',
+                    '---------------------------------------------------------------------------------------------',
+                    'ERROR  missing episode:',
+                    @info
+                );
             }
-            $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
         }
     }
 
@@ -506,7 +673,7 @@ sub main #()
         walkDir ($rootDir);
         $isKeepLibrary and $newLibraryFound and logger ('I', "keeping library from folder: '${rootDir}'");
     }
-    $isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
+    #$isVerbose > 1 and logger ('T', "---------------------------------------------------------------------------------------------");
     $isSummary and printMissingSeries();
     logger ('I', "duration ".(time () - $startTime)." sec.");
     return 1;
