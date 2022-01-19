@@ -214,7 +214,7 @@ sub readLibrary #($file)
                     my @seasonMatches = $elem->look_down('id' => qr/^.*?(season|staffel).*$/i);
                     foreach my $seasonElement (reverse @seasonMatches)  {
                         if (ref $seasonElement eq 'HTML::Element') {
-                            ($season = $seasonElement->id) =~ s#^.*?(\d+).*?$#$1#i;
+                            ($season = $seasonElement->id) =~ s#^.*?(\d+)[^\d]*?$#$1#i;
                             $season and last;
                         }
                     }
@@ -371,6 +371,10 @@ sub readLibrary #($file)
                         $isVerbose > 1 and logger('T', "no episode column found, skipping table: $libKey");
                         last ROWS;
                     }
+                    unless ($key =~ m/[a-z]+/i) {
+                        $isVerbose > 1 and logger('T', "none character data found, skipping row: $key");
+                        next ROWS;
+                    }
 
                     $data{'-content'} = $key;
                     $data{'-library'} = $libKey;
@@ -437,9 +441,9 @@ sub checkFile #($fileName, $path)
     my $bn = basename($fileName);
     my $bnOrg = $bn;
     my $bn_enc = !Encode::is_utf8($bn) ? Encode::decode('utf-8', $bn) : $bn;
-    my $seKeyPattern = qr/([_(]*S\d[^_-]*_E\d[^_-]*[_)]*)/;
+    my $seKeyPattern = qr/([_(]*S\d[^_-]*_?E\d[^_-]*[_)]*)/;
     #TODO: Check if this could be used as fallback
-    $bn_enc =~ s/$seKeyPattern//g; # ignore existing se-keys
+    $bn_enc =~ s/^${seKeyPattern}[-_]+//g; # ignore existing se-keys
     my $rc = 0;
     foreach my $libraryFile (@{$library{'-libraryKeys'}}) {
         $libraryFile =~ m/^-/ and next;
@@ -453,8 +457,8 @@ sub checkFile #($fileName, $path)
             # match: (S01_E02_)?(Thema)(<search pattern from HTML [regex generator: getRegEx]>)
             my $pattern = "^(([^-]+)(?:-[^-]+)?(?:$row->{'-regex'}))";
             # append se-key as fallback
-            (my $seKeyPattern = $seKey) =~ s/^.*S0*([^E_]+)_E0*([^_]+).*$/S0*$1_E0*$2/;
-            $pattern .= "|.*?(${seKeyPattern})";
+            (my $seKeyPatternLib = $seKey) =~ s/^.*S0*([^E_]+)_E0*([^_]+).*$/S0*$1_E0*$2/;
+            $pattern .= "|.*?(${seKeyPatternLib})[-_)]";
             my $re = qr/$pattern/ui;
             if ($bn_enc =~ $re) {
                 (my $match = $1) //= '';
@@ -469,12 +473,17 @@ sub checkFile #($fileName, $path)
                 );
 
                 #if ($bn =~ qr/^(S[^_]+_E[^_]+|$row->{'-se_key'})_/) {
-                my @seMatchesBn = ($bn =~ m/$seKeyPattern/g);
-                if ($bn =~ qr/^($seKey)_/ && scalar @seMatchesBn == 1) {
+                my @seMatchesBn = ($bn =~ m/^${seKeyPatternLib}-/g);
+                if ($bn =~ qr/^($seKey)[-_]+/ && scalar @seMatchesBn == 1) {
                     $isVerbose and logger ('T', "* matched '$bn' already contains series key '${seKey}', keeping current file name.");
                 } else {
-                    (my $newFileName = ${bn}) =~ s/$seKeyPattern//g; # remove old/wrong key from source file
-                    $newFileName = "${seKey}_${newFileName}";
+                    (my $newFileName = ${bn}) =~ s/${seKeyPattern}[-_]*//g; # remove old/wrong key from source file
+                    # remove useless content from file name
+                    $newFileName =~ s/-(Folge|Episode|Staffel|Season)_?\d+_+/-/i;
+                    $newFileName =~ s/_+(Folge|Episode|Staffel|Season)_?\d+-/-/i;
+                    $newFileName =~ s/__+/_/;
+                    # build new file name (prefix S and E)
+                    $newFileName = "${seKey}-${newFileName}";
                     my $renRc = renameFileSet($bn, $newFileName, $path);
                     if ($renRc == 99) {
                         $row->{'-downloading'} = 1;
@@ -513,7 +522,6 @@ sub checkFile #($fileName, $path)
 }
 
 my %seenDir;
-my %multiDir;
 sub walkDir #($item)
 {
     my ($item) = @_;
@@ -521,18 +529,16 @@ sub walkDir #($item)
     (my $globDir = $item) =~ s{\\}{/}g;
     $globDir =~ s/ /\\ /g;
     $globDir =~ s/'/\\'/g;
+    if (exists $seenDir {$globDir}) {
+        $isVerbose > 1 and print STDERR "\nTRACE  already seen folder: ".$globDir;
+        return 1;
+    }
+    $seenDir {$globDir} = 1;
     foreach (glob("${globDir}/*")) {
         s/\\ / /g;
         s/\\'/'/g;
         if (-d $_) {
-            (my $subDir = $_) =~ s/^$globDir//;
-            if (exists $seenDir {$subDir}) {
-                $isVerbose > 1 and print STDERR "\nTRACE  already seen folder: ".$seenDir {$subDir};
-                exists $multiDir {$subDir} or $multiDir {$subDir} = $seenDir {$subDir};
-                $multiDir {$subDir} .= "\n\t$_";
-            }
-            $seenDir {$subDir} = $_;
-            $isVerbose > 1 and logger ('T', "scanning folder: '$_'", 
+            $isVerbose > 1 and logger ('T', "scanning folder: '$_'",
                 "---------------------------------------------------------------------------------------------");
             walkDir ($_);
         } elsif (-f $_ && ($isAllFiles || $_ =~ $videoFileFilter)) {
@@ -751,3 +757,5 @@ Intention:
 - Automatic detection by Plex Media Server
 
 =cut
+
+
