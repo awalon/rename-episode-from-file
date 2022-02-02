@@ -1,14 +1,18 @@
-#!/usr/bin/perl -w -CSD
+#!/usr/bin/perl -w
+# -CSD
 use strict;
 use warnings FATAL => 'all';
 use utf8;
 use Encode;
-#use open qw(:std :encoding(utf-8));
 use Time::Local;
 use Data::Dumper;
 use Getopt::Long;
 use Pod::Usage;
 use HTML::TreeBuilder;
+
+binmode STDOUT, ':encoding(UTF-8)';
+binmode STDERR, ':encoding(UTF-8)';
+binmode STDIN, ':encoding(UTF-8)';
 
 BEGIN {
     $0 =~ m=^((.*)[:/\\])?(\w+)(\..*)?$=;
@@ -27,6 +31,7 @@ my $isDuplicate = 0;
 my $useEpisodeOfYear = 0;
 my $isKeepLibrary = 0;
 my $isDumpLibrary = 0;
+my $episodeListFile = undef;
 my $filterLibrary = undef;
 my $isAllFiles = 0;
 my $videoFileFilter = qr/\.mp(?:eg)?4$/i;
@@ -87,9 +92,10 @@ sub renameFileSet #($oldFileName, $newFileName, $path);
     foreach (glob("${globKey}*")) {
         s/\\ / /g;
         s/\\'/'/g;
+        my $item = Encode::decode_utf8($_);
 
-        if (-f $_) {
-            my $source = $_;
+        if (-f $item) {
+            my $source = $item;
             my (undef, $ext) = basename($source);
             my $target = "${path}/${newFn}.${ext}";
             $target =~ s/\\ / /g;
@@ -113,6 +119,27 @@ sub renameFileSet #($oldFileName, $newFileName, $path);
     return $rc;
 }
 
+# clean string from HTML parser
+sub cs #($string, $forceDecode)
+{
+    my ($string, $forceDecode) = @_;
+
+    if (defined($string)) {
+        # remove some special chars
+        $string =~ s/[\xAD\xA0]//gi;
+
+        $forceDecode and $string = Encode::decode('utf-8', $string);
+
+        if (!utf8::valid($string)) {
+            utf8::encode($string);                      # turn off utf-8 flag
+            $string = Encode::decode('utf-8', $string); # replace invalid chars with U+FFFD
+        }
+        # remove control chars
+        $string =~ s/[[:cntrl:]]//ugi;
+    }
+    return $string;
+}
+
 sub getRegEx #($rowHash);
 {
     my %data = @_;
@@ -123,7 +150,7 @@ sub getRegEx #($rowHash);
 
         (my $val = $data{$key}) =~ s#^\s*(.*)\s*$#$1#; # trim
         my $len = length($val);
-        $len > 3 or next; # only content with more than 3 chars
+        $len >= 3 or next; # only content with more than 2 chars (ex.: Tatort "HAL" )
         my $withDate = $len > 4 ? '(?:[\(_]?(?:\d{2}|\d{4})[\)_]?)?' : '';
         my $withEpisode = $len > 4 ? '(?:[\(_]*?(?:episode|folge)_\d+[\)_]*?)?' : '';
 
@@ -131,7 +158,7 @@ sub getRegEx #($rowHash);
         $val =~ s#([_\s]+)#~~space~~#ug; # normalize space
         $val =~ s#[\\/]#~~slash~~#g; # mask '/' and '\' and make them optional
 
-        $val =~ s#([\.\?,:\-\(\)])#_?\\$1_?#g; # mask and allow spaces before and after: dot, ...
+        $val =~ s#([\.\?,:\-\(\)])#_?\\$1?_?#g; # make optional (for "\b") and mask and allow spaces before and after: dot, ...
 
         $val =~ s#(ß|ss)#(ß|ss)#iug; # handle special char "ß"
         $val =~ s#[^a-z0-9\\_\.\?,:\-\(\)\|~]#.*?#iug; # non greedy wildcard for any non ASCII char
@@ -142,7 +169,7 @@ sub getRegEx #($rowHash);
         $val =~ s#~~space~~#[_ ]*?#g;
         $val =~ s#~~dot~~#\\.?#g;
 
-        push @regex, sprintf "(-\\2?[-_]*?%s%s_*?\\2?%s[-_]*?\\2?-)", $withEpisode, $val, $withDate; # allow optional date (year)
+        push @regex, sprintf "(-\\2?[-_]*?%s%s_*?\\2?%s[-_]*?\\2?)\\b", $withEpisode, $val, $withDate; # allow optional date (year)
     }
     return join ("|", @regex); # join all cell regex groups with "or"
 }
@@ -153,9 +180,18 @@ sub getEpisodeKey #($season, $episode, ?$pattern)
     $pattern //= 'S%03s_E%04s';
     $season //= 1;
     $episode //= 0;
+
     # remove leading season from episode
     $episode =~ s/^$season[\.,_]0*([^0]+\d*)$/$1/g;
-    return sprintf($pattern, $season, $episode);
+
+    # extract optional part from episode, ex.: 43.1
+    $episode =~ s/^(\d+)([^\d]+(?<part>.*))?$/$1/;
+    (my $part = $+{part}) //= '';
+    my $newKey = sprintf($pattern, $season, $episode);
+
+    # if found append "_P00" with part of episode
+    $part and $newKey .= sprintf('_P%02s', $part);
+    return $newKey;
 }
 
 sub getNoInSeries #(@columns)
@@ -214,7 +250,7 @@ sub readLibrary #($file)
                     my @seasonMatches = $elem->look_down('id' => qr/^.*?(season|staffel).*$/i);
                     foreach my $seasonElement (reverse @seasonMatches)  {
                         if (ref $seasonElement eq 'HTML::Element') {
-                            ($season = $seasonElement->id) =~ s#^.*?(\d+)[^\d]*?$#$1#i;
+                            ($season = cs($seasonElement->id, 1)) =~ s#^.*?(\d+)[^\d]*?$#$1#i;
                             $season and last;
                         }
                     }
@@ -223,6 +259,7 @@ sub readLibrary #($file)
             }
             $season //= 1;
 
+            # find table header (detect column names)
             my @head = $table->find('th');
             my $parentRow;
             my $maxRows = 1;
@@ -232,7 +269,7 @@ sub readLibrary #($file)
             my %colSpans = ('-end' => undef);
             my %rowSpans = ();
             foreach my $head (@head) {
-                my $currentValue = $head->as_text_trimmed;
+                my $currentValue = cs($head->as_text_trimmed, 1);
                 $isVerbose > 2 and logger ('T', "extract column field: $currentValue");
 
                 my $parent = $head->parent;
@@ -246,7 +283,14 @@ sub readLibrary #($file)
                 }
 
                 if ($curRow > 0) {
-                    exists $rowSpans{$curCol} and $rowSpans{$curCol}-- > 0 and $curCol++;
+                    # find first column in current row without rowspan
+                    while (exists $rowSpans{$curCol}) {
+                        if ($rowSpans{$curCol}-- > 0) {
+                            $curCol++;
+                        } else {
+                            last;
+                        }
+                    }
                 }
                 if (defined $head->attr('rowspan')) {
                     $head->attr('rowspan') > $maxRows and $maxRows = $head->attr('rowspan');
@@ -264,7 +308,7 @@ sub readLibrary #($file)
                 } else {
                     # search for th having title attribute defined
                     my @title = $head->look_down('title' => qr/^.+$/i);
-                    my $columnName = scalar @title ? $title[-1]->attr('title') : $currentValue;
+                    my $columnName = scalar @title ? cs($title[-1]->attr('title'), 1) : $currentValue;
                     if ($curRow > 1 && (exists $colSpans{$curCol} || $colSpans{'-end'})) {
                         # fill values for colspan fields
                         $fields[$curCol] = $columnName;
@@ -281,7 +325,7 @@ sub readLibrary #($file)
                 }
             }
 
-            #my @rows = $table->find('tr');
+            # for each table row (tr), read episode data
             my @rows = $table->look_down(_tag => 'tr');
             my $r = 0;
             my $episodeColumn = getNoInSeries (@fields);
@@ -293,7 +337,7 @@ sub readLibrary #($file)
                 map {$_->delete} $row->find('small');
                 map {$_->delete} $row->find('sup');
 
-                my $key = $row->as_text_trimmed;
+                my $key = cs($row->as_text_trimmed, 1);
 
                 my @cells = $row->look_down(_tag => 'td');
                 my $cellsCount = scalar @cells;
@@ -316,9 +360,10 @@ sub readLibrary #($file)
                         }
                     }
 
-                    $value = $cell->as_text_trimmed;
+                    # read data from current cell
+                    $value = cs($cell->as_text_trimmed, 1);
                     if ($cell->id) {
-                        $id //= $cell->id;
+                        $id //= cs($cell->id, 1);
                     }
                     if (defined $cell->attr('rowspan')) {
                         # remember spanned row values for next cells
@@ -340,13 +385,13 @@ sub readLibrary #($file)
                 for (my $c = $i; $c < $colCount; $c++) {
                     if (exists $rowSpans{$c} and $rowSpans{$c}{'-row'}-- > 0) {
                         # insert spanned cell from previous row(s)
-                        my $value = $rowSpans{$c}{'-value'};
+                        my $renderedValue = $rowSpans{$c}{'-value'};
                         $id //= $rowSpans{$c}{'-id'};
 
                         if (scalar @fields > $c) {
-                            $data{$fields[$c]} = $value;
+                            $data{$fields[$c]} = $renderedValue;
                         } else {
-                            $data{$c} = $value;
+                            $data{$c} = $renderedValue;
                         }
                     }
                 }
@@ -385,7 +430,7 @@ sub readLibrary #($file)
                     $data{'-se_key'} =~ s#[^a-z0-9_]#_#ig;
                     ($data{'-year'} = $key) =~ s/\b$data{'-episode'}\b//; # remove episode (could conflict with year)
                     $data{'-year'} =~ s#^.*?((19|20|21)\d{2}).*?$#$1# or $data{'-year'} = ''; # extract year
-                    $id or $id = $data{'-se_key'};
+                    $id = $data{'-se_key'} . ($id ? '__' . $id : '');
                     (exists $db{$id} or !$id) and $id = $r++;
                     $data{'-id'} = $id;
                     $newEntries++;
@@ -440,10 +485,15 @@ sub checkFile #($fileName, $path)
 
     my $bn = basename($fileName);
     my $bnOrg = $bn;
-    my $bn_enc = !Encode::is_utf8($bn) ? Encode::decode('utf-8', $bn) : $bn;
+    my $bnNoKey = $bn; #!Encode::is_utf8($bn) ? Encode::decode('utf-8', $bn) : $bn;
+    $bnNoKey =~ s/(?<dash>[_-])?(?<id>\d+)\.(?<ext>[^\.]+)$//; # extract and remove ID and extension
+    (my $matchDash = $+{dash}) ||= '-';
+    (my $matchId = $+{id}) //= '';
+    (my $matchExt = $+{ext}) //= '';
+
     my $seKeyPattern = qr/([_(]*S\d[^_-]*_?E\d[^_-]*[_)]*)/;
-    #TODO: Check if this could be used as fallback
-    $bn_enc =~ s/^${seKeyPattern}[-_]+//g; # ignore existing se-keys
+    #TODO: Check if this key could be used as fallback
+    $bnNoKey =~ s/^${seKeyPattern}[\-_]+//g; # ignore existing se-keys
     my $rc = 0;
     foreach my $libraryFile (@{$library{'-libraryKeys'}}) {
         $libraryFile =~ m/^-/ and next;
@@ -455,20 +505,22 @@ sub checkFile #($fileName, $path)
             my $seKey = $useEpisodeOfYear ? $row->{'-se_key_by_year'} : $row->{'-se_key'};
 
             # match: (S01_E02_)?(Thema)(<search pattern from HTML [regex generator: getRegEx]>)
-            my $pattern = "^(([^-]+)(?:-[^-]+)?(?:$row->{'-regex'}))";
+            my $pattern = "^(?<match>(?<topic>[^-]+)(?:-[^-]+)?(?<title>$row->{'-regex'}))";
+
             # append se-key as fallback
             (my $seKeyPatternLib = $seKey) =~ s/^.*S0*([^E_]+)_E0*([^_]+).*$/S0*$1_E0*$2/;
-            $pattern .= "|.*?(${seKeyPatternLib})[-_)]";
+            $pattern .= "|.*?(?<key>${seKeyPatternLib})[\\-_)]";
             my $re = qr/$pattern/ui;
-            if ($bn_enc =~ $re) {
-                (my $match = $1) //= '';
-                (my $matchTopic = $2) //= '';
-                (my $matchBySeKey = $3) //= '';
+            if ($bnNoKey =~ $re) {
+                (my $match = $+{match}) //= '';
+                (my $matchTopic = $+{topic}) //= '';
+                (my $matchTitle = $+{title}) //= '';
+                (my $matchBySeKey = $+{key}) //= '';
 
                 $isVerbose > 1 and logger ('T',
                     "* matched '$bn'",
                     "  with pattern '$pattern'",
-                    "  [match::'${match}'; matchTopic::'${matchTopic}'; matchSeKey::'${matchBySeKey}']",
+                    "  [match::'${match}'; matchTopic::'${matchTopic}'; matchSeKey::'${matchBySeKey}'; matchTitle::'${matchTitle}'; matchId::'${matchId}']",
                     "  from '${rowKey}'\@'${libraryFile}'"
                 );
 
@@ -477,11 +529,15 @@ sub checkFile #($fileName, $path)
                 if ($bn =~ qr/^($seKey)[-_]+/ && scalar @seMatchesBn == 1) {
                     $isVerbose and logger ('T', "* matched '$bn' already contains series key '${seKey}', keeping current file name.");
                 } else {
-                    (my $newFileName = ${bn}) =~ s/${seKeyPattern}[-_]*//g; # remove old/wrong key from source file
+                    (my $newFileName = ${bn}) =~ s/${seKeyPattern}[\-_]*//g; # remove old/wrong key from source file
                     # remove useless content from file name
                     $newFileName =~ s/-(Folge|Episode|Staffel|Season)_?\d+_+/-/i;
                     $newFileName =~ s/_+(Folge|Episode|Staffel|Season)_?\d+-/-/i;
-                    $newFileName =~ s/__+/_/;
+                    $newFileName =~ s/[ES]\d+//g; # S001 or E001
+                    $newFileName =~ s/_?()//; # empty parentheses
+                    $newFileName =~ s/__+/_/; # reduce multiple "_" to one
+                    # normalize ID by adding a dash
+                    $newFileName =~ s/[-_]*${matchId}\.${matchExt}$/${matchDash}${matchId}.${matchExt}/;
                     # build new file name (prefix S and E)
                     $newFileName = "${seKey}-${newFileName}";
                     my $renRc = renameFileSet($bn, $newFileName, $path);
@@ -537,12 +593,14 @@ sub walkDir #($item)
     foreach (glob("${globDir}/*")) {
         s/\\ / /g;
         s/\\'/'/g;
-        if (-d $_) {
-            $isVerbose > 1 and logger ('T', "scanning folder: '$_'",
+        $item = Encode::decode_utf8($_);
+
+        if (-d $item) {
+            $isVerbose > 1 and logger ('T', "scanning folder: '${item}'",
                 "---------------------------------------------------------------------------------------------");
-            walkDir ($_);
-        } elsif (-f $_ && ($isAllFiles || $_ =~ $videoFileFilter)) {
-            checkFile ($_, $globDir);
+            walkDir ($item);
+        } elsif (-f $item && ($isAllFiles || $item =~ $videoFileFilter)) {
+            checkFile ($item, $globDir);
         }
     }
 
@@ -556,8 +614,18 @@ sub printMissingSeries #()
     my $seen = 0;
     my $skip = 0;
     my $ren = 0;
+    my $EL;
 
     my %filter = ('missing' => 0, 'seen' => 0, 'duplicate' => 0);
+
+    if (defined $episodeListFile) {
+        if (open($EL, '>', $episodeListFile)) {
+            binmode $EL, ':encoding(UTF-8)';
+        } else {
+            logger('E', "+++ can not open episode list '${episodeListFile}: $!");
+            $EL = undef;
+        }
+    }
 
     foreach my $libraryFile (@{$library{'-libraryKeys'}}) {
         $libraryFile =~ m/^-/ and next;
@@ -579,6 +647,9 @@ sub printMissingSeries #()
                 if (defined $filterLibrary) {
                     $row->{'-content'} =~ $filterLibrary and ++$filter{'seen'};
                 }
+                my $fileName = @{$row->{'-matchedFile'}}[0];
+                #$EL and printf $EL "☑ %s: %-120s\n%s\n\n", $row->{'-se_key'}, $fileName, join("\n", @info);
+                $EL and printf $EL "☑ %s: %-120s\n", $row->{'-se_key'}, $fileName;
                 if ($row->{'-matched'} > 1) {
                     $dup++;
                     if (defined $filterLibrary) {
@@ -598,6 +669,7 @@ sub printMissingSeries #()
                 if (defined $filterLibrary) {
                     $row->{'-content'} =~ $filterLibrary and ++$filter{'missing'} or next;
                 }
+                $EL and printf $EL "☒ %s: %-120s\n%s\n\n", $row->{'-se_key'}, '*** missing ***', join("\n", @info);
                 $isMissing or next;
                 logger ('E',
                     '---------------------------------------------------------------------------------------------',
@@ -606,6 +678,11 @@ sub printMissingSeries #()
                 );
             }
         }
+    }
+
+    # close episode list file
+    if (defined($EL) && fileno $EL) {
+        close($EL);
     }
 
     logger ('I', "---------------------------------------------------------------------------------------------",
@@ -629,15 +706,11 @@ sub main #()
     my $isHelp = 0;
     my $isUsage = 0;
 
-    # auto flush
-    binmode STDIN,  ":unix";
-    binmode STDOUT, ":unix";
-    binmode STDERR, ":unix";
-
     Getopt::Long::Configure ("no_ignore_case", "bundling_override");
     GetOptions (
         "folder|f=s@"         => \@rootDirs,
         "summary|s!"          => \$isSummary,
+        "episode-list|el=s"   => \$episodeListFile,
         "show-missing|M!"     => \$isMissing,
         "show-duplicates|D!"  => \$isDuplicate,
         "dry-run|dr!"         => \$isDryRun,
@@ -706,6 +779,7 @@ B<rename-episode-from-file.pl> [options]
     --folder=<folder>*,-f <folder>
                             list of folders which will be processed
     --summary,-s            show summary (disable with --no-summary)
+    --episode-list,-el      create episode list with found/missing episode
     --show-missing,-M       show missing episodes
     --show-duplicates,-D    show duplicate files
     --dry-run,-dr           simulation only, don't rename files
