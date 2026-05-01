@@ -1,3 +1,14 @@
+# This project has moved
+
+> [!WARNING]  
+> This repository is now maintained at
+> [https://codeberg.org/Awalon/rename-episode-from-file](https://codeberg.org/Awalon/rename-episode-from-file).
+
+> [!CAUTION]  
+> This GitHub mirror may be out of date. Please file issues and
+> contributions on Codeberg.
+
+
 # TV Series Renamer (beta)
 
 [![Poject: Rename Episode](https://img.shields.io/badge/Project-rename--episode--from--file-red.svg?style=flat-square)](https://github.com/awalon/rename-episode-from-file/)
